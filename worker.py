@@ -26,7 +26,16 @@ load_dotenv()
 
 # Configuration
 SUPABASE_URL = os.getenv("SUPABASE_RAW_POOLER_URL", "postgres://...")
-VAST_VLLM_URL = os.getenv("VAST_VLLM_URL", "PLACEHOLDER").rstrip("/")
+# VAST_VLLM_URL accepts comma-separated list for multi-GPU round-robin load balancing
+_RAW_URLS = os.getenv("VAST_VLLM_URL", "PLACEHOLDER")
+VAST_VLLM_URLS = [u.strip().rstrip("/") for u in _RAW_URLS.split(",") if u.strip()]
+VAST_VLLM_URL = VAST_VLLM_URLS[0] if VAST_VLLM_URLS else "PLACEHOLDER"  # back-compat single-URL refs
+import itertools as _itertools, threading as _threading
+_url_cycle = _itertools.cycle(VAST_VLLM_URLS) if VAST_VLLM_URLS else _itertools.cycle(["PLACEHOLDER"])
+_url_lock = _threading.Lock()
+def _next_vllm_url() -> str:
+    with _url_lock:
+        return next(_url_cycle)
 LLM_API_KEY = os.getenv("LLM_API_KEY") or os.getenv("GROQ_API_KEY") or os.getenv("OPENROUTER_API_KEY")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50"))
 WORKER_CONCURRENCY = int(os.getenv("WORKER_CONCURRENCY", "4"))
@@ -80,23 +89,25 @@ def get_db_connection():
 
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
 async def healthcheck_vllm():
-    """Verify LLM endpoint is live and model is loaded."""
-    base = VAST_VLLM_URL.rstrip("/")
-    models_path = "/models" if base.endswith("/v1") else "/v1/models"
+    """Verify EVERY configured LLM endpoint is live and model is loaded."""
     headers = {}
     if LLM_API_KEY:
         headers["Authorization"] = f"Bearer {LLM_API_KEY}"
     async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            resp = await client.get(f"{base}{models_path}", headers=headers)
-            resp.raise_for_status()
-            models = resp.json().get("data", [])
-            model_names = [m.get("id") for m in models]
-            logger.info(f"LLM healthy; models loaded (sample): {model_names[:5]}")
-            return True
-        except Exception as e:
-            logger.error(f"LLM healthcheck failed: {e}")
-            raise
+        for base in VAST_VLLM_URLS:
+            base = base.rstrip("/")
+            models_path = "/models" if base.endswith("/v1") else "/v1/models"
+            try:
+                resp = await client.get(f"{base}{models_path}", headers=headers)
+                resp.raise_for_status()
+                models = resp.json().get("data", [])
+                model_names = [m.get("id") for m in models]
+                logger.info(f"LLM healthy at {base}; models: {model_names[:3]}")
+            except Exception as e:
+                logger.error(f"LLM healthcheck failed for {base}: {e}")
+                raise
+        logger.info(f"All {len(VAST_VLLM_URLS)} vLLM endpoint(s) healthy")
+        return True
 
 
 async def wait_for_vllm_startup():
@@ -184,8 +195,8 @@ async def call_vllm(system: str, user: str, temperature: float = TEMPERATURE_INI
     if LLM_API_KEY:
         headers["Authorization"] = f"Bearer {LLM_API_KEY}"
 
-    # If VAST_VLLM_URL already includes /v1, don't double it
-    base = VAST_VLLM_URL.rstrip("/")
+    # Round-robin: pick the next endpoint from the configured pool
+    base = _next_vllm_url().rstrip("/")
     completions_path = "/chat/completions" if base.endswith("/v1") else "/v1/chat/completions"
 
     # Retry on 429 with backoff. Up to 5 attempts, exponentially increasing wait.
@@ -381,7 +392,7 @@ async def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     logger.info(f"Starting Rocket Alumni LLM Contact Extractor")
-    logger.info(f"  vLLM URL: {VAST_VLLM_URL}")
+    logger.info(f"  vLLM URLs ({len(VAST_VLLM_URLS)}): {VAST_VLLM_URLS}")
     logger.info(f"  Model: {MODEL_NAME}")
     logger.info(f"  Batch size: {BATCH_SIZE}, Concurrency: {WORKER_CONCURRENCY}")
 

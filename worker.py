@@ -27,6 +27,7 @@ load_dotenv()
 # Configuration
 SUPABASE_URL = os.getenv("SUPABASE_RAW_POOLER_URL", "postgres://...")
 VAST_VLLM_URL = os.getenv("VAST_VLLM_URL", "PLACEHOLDER").rstrip("/")
+LLM_API_KEY = os.getenv("LLM_API_KEY") or os.getenv("GROQ_API_KEY") or os.getenv("OPENROUTER_API_KEY")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50"))
 WORKER_CONCURRENCY = int(os.getenv("WORKER_CONCURRENCY", "4"))
 MODEL_NAME = os.getenv("MODEL_NAME", "google/gemma-2-9b-it")
@@ -79,17 +80,22 @@ def get_db_connection():
 
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
 async def healthcheck_vllm():
-    """Verify vLLM endpoint is live and model is loaded."""
+    """Verify LLM endpoint is live and model is loaded."""
+    base = VAST_VLLM_URL.rstrip("/")
+    models_path = "/models" if base.endswith("/v1") else "/v1/models"
+    headers = {}
+    if LLM_API_KEY:
+        headers["Authorization"] = f"Bearer {LLM_API_KEY}"
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
-            resp = await client.get(f"{VAST_VLLM_URL}/v1/models")
+            resp = await client.get(f"{base}{models_path}", headers=headers)
             resp.raise_for_status()
             models = resp.json().get("data", [])
             model_names = [m.get("id") for m in models]
-            logger.info(f"vLLM healthy; models loaded: {model_names}")
+            logger.info(f"LLM healthy; models loaded (sample): {model_names[:5]}")
             return True
         except Exception as e:
-            logger.error(f"vLLM healthcheck failed: {e}")
+            logger.error(f"LLM healthcheck failed: {e}")
             raise
 
 
@@ -174,18 +180,48 @@ async def call_vllm(system: str, user: str, temperature: float = TEMPERATURE_INI
     except Exception:
         pass
 
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(
-                f"{VAST_VLLM_URL}/v1/chat/completions",
-                json=payload,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return data.get("choices", [{}])[0].get("message", {}).get("content", "")
-    except Exception as e:
-        logger.error(f"vLLM call failed: {e}")
-        return None
+    headers = {}
+    if LLM_API_KEY:
+        headers["Authorization"] = f"Bearer {LLM_API_KEY}"
+
+    # If VAST_VLLM_URL already includes /v1, don't double it
+    base = VAST_VLLM_URL.rstrip("/")
+    completions_path = "/chat/completions" if base.endswith("/v1") else "/v1/chat/completions"
+
+    # Retry on 429 with backoff. Up to 5 attempts, exponentially increasing wait.
+    for attempt in range(5):
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(
+                    f"{base}{completions_path}",
+                    json=payload,
+                    headers=headers,
+                )
+                if resp.status_code == 429:
+                    # Honor Retry-After header if present, else exponential backoff
+                    retry_after = resp.headers.get("retry-after")
+                    if retry_after:
+                        try:
+                            wait_s = float(retry_after)
+                        except ValueError:
+                            wait_s = 5 * (2 ** attempt)
+                    else:
+                        wait_s = 5 * (2 ** attempt)
+                    wait_s = min(wait_s, 60)
+                    logger.warning(f"429 rate-limited, sleeping {wait_s:.1f}s (attempt {attempt+1}/5)")
+                    await asyncio.sleep(wait_s)
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        except httpx.HTTPStatusError as e:
+            logger.error(f"LLM HTTP error: {e.response.status_code} {e.response.text[:200]}")
+            return None
+        except Exception as e:
+            logger.error(f"LLM call failed: {e}")
+            return None
+    logger.error("LLM call gave up after 5 retries on 429")
+    return None
 
 
 def parse_response(raw: str) -> Optional[dict]:
@@ -258,52 +294,49 @@ async def process_row(
 
 
 async def upsert_batch(results: list[ContactExtractionResult]):
-    """Upsert results to output table."""
+    """Upsert results to output table using execute_values for ~10x speedup."""
+    if not results:
+        return
     conn = get_db_connection()
     try:
         cur = conn.cursor()
-        for result in results:
-            cur.execute(
-                f"""
-                INSERT INTO {OUTPUT_TABLE}
-                (domain_key, school_name, city, state, contacts, generic_emails,
-                 owner_name, owner_title, model_used, extracted_at, latency_ms,
-                 raw_response, retry_count, extraction_status, source_summary_chars, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
-                ON CONFLICT (domain_key) DO UPDATE SET
-                  contacts = EXCLUDED.contacts,
-                  generic_emails = EXCLUDED.generic_emails,
-                  owner_name = EXCLUDED.owner_name,
-                  owner_title = EXCLUDED.owner_title,
-                  model_used = EXCLUDED.model_used,
-                  extracted_at = EXCLUDED.extracted_at,
-                  latency_ms = EXCLUDED.latency_ms,
-                  raw_response = EXCLUDED.raw_response,
-                  retry_count = EXCLUDED.retry_count,
-                  extraction_status = EXCLUDED.extraction_status,
-                  source_summary_chars = EXCLUDED.source_summary_chars,
-                  updated_at = now()
-                """,
-                (
-                    result.domain_key,
-                    result.school_name,
-                    result.city,
-                    result.state,
-                    extras.Json(result.contacts),
-                    extras.Json(result.generic_emails),
-                    result.owner_name,
-                    result.owner_title,
-                    result.model_used,
-                    result.extracted_at,
-                    result.latency_ms,
-                    result.raw_response,
-                    result.retry_count,
-                    result.extraction_status,
-                    result.source_summary_chars,
-                ),
+        values = [
+            (
+                r.domain_key, r.school_name, r.city, r.state,
+                extras.Json(r.contacts), extras.Json(r.generic_emails),
+                r.owner_name, r.owner_title, r.model_used, r.extracted_at,
+                r.latency_ms, r.raw_response, r.retry_count, r.extraction_status,
+                r.source_summary_chars,
             )
+            for r in results
+        ]
+        extras.execute_values(
+            cur,
+            f"""
+            INSERT INTO {OUTPUT_TABLE}
+            (domain_key, school_name, city, state, contacts, generic_emails,
+             owner_name, owner_title, model_used, extracted_at, latency_ms,
+             raw_response, retry_count, extraction_status, source_summary_chars)
+            VALUES %s
+            ON CONFLICT (domain_key) DO UPDATE SET
+              contacts = EXCLUDED.contacts,
+              generic_emails = EXCLUDED.generic_emails,
+              owner_name = EXCLUDED.owner_name,
+              owner_title = EXCLUDED.owner_title,
+              model_used = EXCLUDED.model_used,
+              extracted_at = EXCLUDED.extracted_at,
+              latency_ms = EXCLUDED.latency_ms,
+              raw_response = EXCLUDED.raw_response,
+              retry_count = EXCLUDED.retry_count,
+              extraction_status = EXCLUDED.extraction_status,
+              source_summary_chars = EXCLUDED.source_summary_chars,
+              updated_at = now()
+            """,
+            values,
+            page_size=100,
+        )
         conn.commit()
-        logger.info(f"Upserted {len(results)} rows")
+        logger.info(f"Upserted {len(results)} rows (execute_values)")
     except Exception as e:
         logger.error(f"Upsert failed: {e}")
         conn.rollback()
@@ -313,23 +346,36 @@ async def upsert_batch(results: list[ContactExtractionResult]):
 
 
 def fetch_batch() -> list[dict]:
-    """Fetch next batch from input view."""
-    conn = get_db_connection()
-    try:
-        cur = conn.cursor(cursor_factory=extras.RealDictCursor)
-        cur.execute(f"SELECT * FROM {INPUT_VIEW} LIMIT %s", (BATCH_SIZE,))
-        rows = cur.fetchall()
-        return [dict(row) for row in rows]
-    except Exception as e:
-        logger.error(f"Fetch batch failed: {e}")
-        return []
-    finally:
-        cur.close()
-        conn.close()
+    """Fetch next batch from input view with retry on transient pool errors."""
+    last_err = None
+    for attempt in range(5):
+        conn = None
+        cur = None
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor(cursor_factory=extras.RealDictCursor)
+            cur.execute(
+                f"SELECT * FROM {INPUT_VIEW} ORDER BY random() LIMIT %s",
+                (BATCH_SIZE,),
+            )
+            rows = cur.fetchall()
+            return [dict(row) for row in rows]
+        except Exception as e:
+            last_err = e
+            logger.warning(f"Fetch batch attempt {attempt+1}/5 failed: {e}")
+            try:
+                if cur: cur.close()
+            except Exception: pass
+            try:
+                if conn: conn.close()
+            except Exception: pass
+            time.sleep(2 ** attempt)  # 1, 2, 4, 8, 16s backoff
+    logger.error(f"Fetch batch gave up after 5 retries: {last_err}")
+    return []
 
 
 async def main():
-    """Main worker loop."""
+    """Continuous queue + N consumers + shared httpx.AsyncClient (Layer A)."""
     global shutdown_requested
 
     signal.signal(signal.SIGTERM, signal_handler)
@@ -339,71 +385,93 @@ async def main():
     logger.info(f"  Model: {MODEL_NAME}")
     logger.info(f"  Batch size: {BATCH_SIZE}, Concurrency: {WORKER_CONCURRENCY}")
 
-    # Healthcheck startup
     if not await wait_for_vllm_startup():
         logger.error("Failed to connect to vLLM; exiting")
         sys.exit(1)
 
+    work_queue: asyncio.Queue = asyncio.Queue()
+    write_buffer: list = []
+    write_lock = asyncio.Lock()
     rows_done = 0
-    empty_batch_count = 0
     start_time = time.time()
-    semaphore = asyncio.Semaphore(WORKER_CONCURRENCY)
+    no_op_semaphore = asyncio.Semaphore(WORKER_CONCURRENCY)
 
-    while not shutdown_requested:
-        batch = fetch_batch()
+    async def flush_write_buffer():
+        nonlocal rows_done
+        async with write_lock:
+            if write_buffer:
+                chunk = list(write_buffer)
+                write_buffer.clear()
+            else:
+                return
+        await upsert_batch(chunk)
+        rows_done += len(chunk)
+        elapsed = time.time() - start_time
+        rate = rows_done / elapsed if elapsed > 0 else 0
+        logger.info(f"Progress: {rows_done} rows, rate={rate:.2f}/sec")
 
-        if not batch:
-            empty_batch_count += 1
-            if empty_batch_count >= 5:
-                elapsed = time.time() - start_time
-                rate = rows_done / elapsed if elapsed > 0 else 0
-                logger.info(
-                    f"5 consecutive empty batches; shutting down. "
-                    f"Total: {rows_done} rows in {elapsed:.1f}s ({rate:.2f} rows/sec)"
-                )
+    async def consumer(cid: int, http_client: httpx.AsyncClient):
+        while True:
+            if shutdown_requested:
                 break
-            logger.info(f"Batch empty, sleeping 60s (empty count: {empty_batch_count}/5)")
-            await asyncio.sleep(60)
-            continue
-
-        empty_batch_count = 0
-
-        # Healthcheck per 100 rows
-        if rows_done % 100 == 0 and rows_done > 0:
             try:
-                await healthcheck_vllm()
+                row = await asyncio.wait_for(work_queue.get(), timeout=5.0)
+            except asyncio.TimeoutError:
+                continue
+            if row is None:
+                work_queue.task_done()
+                break
+            try:
+                result = await process_row(row, no_op_semaphore, http_client)
+                if isinstance(result, ContactExtractionResult):
+                    async with write_lock:
+                        write_buffer.append(result)
+                        should_flush = len(write_buffer) >= BATCH_SIZE
+                    if should_flush:
+                        await flush_write_buffer()
             except Exception as e:
-                logger.warning(f"Healthcheck failed at {rows_done} rows: {e}")
+                logger.error(f"Consumer {cid} error: {e}")
+            finally:
+                work_queue.task_done()
 
-        # Process batch concurrently
-        try:
-            async with httpx.AsyncClient() as http_client:
-                tasks = [process_row(row, semaphore, http_client) for row in batch]
-                results = await asyncio.gather(*tasks, return_exceptions=False)
+    async def producer():
+        empty_count = 0
+        while not shutdown_requested:
+            batch = fetch_batch()
+            if not batch:
+                empty_count += 1
+                if empty_count >= 5:
+                    logger.info(f"Producer: 5 empty fetches, sending poison pills")
+                    for _ in range(WORKER_CONCURRENCY):
+                        await work_queue.put(None)
+                    return
+                await asyncio.sleep(60)
+                continue
+            empty_count = 0
+            for row in batch:
+                if shutdown_requested:
+                    for _ in range(WORKER_CONCURRENCY):
+                        await work_queue.put(None)
+                    return
+                await work_queue.put(row)
 
-            # Filter out exceptions
-            results = [r for r in results if isinstance(r, ContactExtractionResult)]
-
-            # Upsert results
-            await upsert_batch(results)
-
-            rows_done += len(results)
-            elapsed = time.time() - start_time
-            rate = rows_done / elapsed if elapsed > 0 else 0
-            failures = sum(1 for r in results if r.extraction_status != "success")
-
-            if rows_done % 50 == 0:
-                logger.info(
-                    f"Progress: {rows_done} rows, rate={rate:.2f}/sec, "
-                    f"failures={failures}/{len(results)}"
-                )
-
-        except Exception as e:
-            logger.error(f"Batch processing failed: {e}")
+    try:
+        async with httpx.AsyncClient() as http_client:
+            producer_task = asyncio.create_task(producer())
+            consumer_tasks = [
+                asyncio.create_task(consumer(i, http_client))
+                for i in range(WORKER_CONCURRENCY)
+            ]
+            await producer_task
+            await asyncio.gather(*consumer_tasks, return_exceptions=False)
+            await flush_write_buffer()
+    except Exception as e:
+        logger.error(f"Main worker error: {e}")
+        sys.exit(1)
 
     elapsed = time.time() - start_time
     rate = rows_done / elapsed if elapsed > 0 else 0
-    logger.info(f"Worker done: {rows_done} rows in {elapsed:.1f}s ({rate:.2f} rows/sec)")
+    logger.info(f"DRAIN DONE: {rows_done} rows in {elapsed:.1f}s ({rate:.2f}/sec)")
 
 
 if __name__ == "__main__":

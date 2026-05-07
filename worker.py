@@ -304,8 +304,8 @@ async def process_row(
         )
 
 
-async def upsert_batch(results: list[ContactExtractionResult]):
-    """Upsert results to output table using execute_values for ~10x speedup."""
+def upsert_batch_sync(results: list[ContactExtractionResult]):
+    """Sync upsert (called via asyncio.to_thread to keep event loop responsive)."""
     if not results:
         return
     conn = get_db_connection()
@@ -415,7 +415,7 @@ async def main():
                 write_buffer.clear()
             else:
                 return
-        await upsert_batch(chunk)
+        await asyncio.to_thread(upsert_batch_sync, chunk)
         rows_done += len(chunk)
         elapsed = time.time() - start_time
         rate = rows_done / elapsed if elapsed > 0 else 0
@@ -448,7 +448,9 @@ async def main():
     async def producer():
         empty_count = 0
         while not shutdown_requested:
-            batch = fetch_batch()
+            # Off-load sync DB call to a thread so event loop stays free for consumers
+            batch = await asyncio.to_thread(fetch_batch)
+            logger.info(f"Producer: fetched batch of {len(batch)} rows")
             if not batch:
                 empty_count += 1
                 if empty_count >= 5:

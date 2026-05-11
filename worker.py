@@ -44,6 +44,10 @@ def _next_vllm_url() -> str:
 
 LLM_API_KEY = os.getenv("LLM_API_KEY") or os.getenv("GROQ_API_KEY") or os.getenv("OPENROUTER_API_KEY")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "200"))
+# FLUSH_BATCH_SIZE: how many results to accumulate before writing to DB.
+# Keep this small (default 100) regardless of BATCH_SIZE, so DB writes happen frequently.
+# BATCH_SIZE controls how many rows are fetched from the input view per cycle.
+FLUSH_BATCH_SIZE = int(os.getenv("FLUSH_BATCH_SIZE", "100"))
 WORKER_CONCURRENCY = int(os.getenv("WORKER_CONCURRENCY", "200"))
 # DB_POOL_SIZE is intentionally decoupled from WORKER_CONCURRENCY.
 # HTTP coroutines = WORKER_CONCURRENCY (200); DB connections = DB_POOL_SIZE (≤40).
@@ -530,7 +534,7 @@ async def main():
                 if isinstance(result, ContactExtractionResult):
                     async with write_lock:
                         write_buffer.append(result)
-                        should_flush = len(write_buffer) >= BATCH_SIZE
+                        should_flush = len(write_buffer) >= FLUSH_BATCH_SIZE
                     if should_flush:
                         await flush_write_buffer()
             except Exception as e:

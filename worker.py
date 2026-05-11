@@ -487,6 +487,13 @@ async def main():
                 work_queue.task_done()
 
     async def producer():
+        """
+        FIX 2026-05-11: producer now waits for the queue to fully drain AND
+        flushes the write buffer before fetching the next batch.  Without this,
+        the NOT IN (SELECT domain FROM staging) subquery re-reads the same
+        BATCH_SIZE domains every cycle because the inserts haven't committed yet,
+        causing an infinite reprocessing loop.
+        """
         empty_count = 0
         while not shutdown_requested:
             batch = await asyncio.to_thread(fetch_batch)
@@ -507,6 +514,12 @@ async def main():
                         await work_queue.put(None)
                     return
                 await work_queue.put(row)
+            # CRITICAL: wait for every queued item to be processed AND committed
+            # before fetching the next batch.  This ensures the NOT IN exclusion
+            # in fetch_batch() sees all newly-inserted staging rows.
+            await work_queue.join()
+            await flush_write_buffer()
+            logger.info("Producer: batch drained and flushed — fetching next batch")
 
     try:
         # Raise connection pool limits so 200 concurrent coroutines don't queue on socket acquisition

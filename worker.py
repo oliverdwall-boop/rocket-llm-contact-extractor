@@ -181,7 +181,10 @@ Rules:
     return system, user
 
 
-async def call_vllm(system: str, user: str, temperature: float = TEMPERATURE_INITIAL) -> Optional[str]:
+async def call_vllm(
+    system: str, user: str, temperature: float = TEMPERATURE_INITIAL,
+    http_client: Optional[httpx.AsyncClient] = None,
+) -> Optional[str]:
     payload = {
         "model": MODEL_NAME,
         "messages": [
@@ -205,25 +208,36 @@ async def call_vllm(system: str, user: str, temperature: float = TEMPERATURE_INI
 
     for attempt in range(5):
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            # Reuse shared client if provided (avoids per-request TCP handshake)
+            if http_client is not None:
+                _client_ctx = None
+                client = http_client
+            else:
+                _client_ctx = httpx.AsyncClient(timeout=60.0)
+                client = await _client_ctx.__aenter__()
+            try:
                 resp = await client.post(
                     f"{base}{completions_path}",
                     json=payload,
                     headers=headers,
+                    timeout=60.0,
                 )
-                if resp.status_code == 429:
-                    retry_after = resp.headers.get("retry-after")
-                    try:
-                        wait_s = float(retry_after) if retry_after else 5 * (2 ** attempt)
-                    except ValueError:
-                        wait_s = 5 * (2 ** attempt)
-                    wait_s = min(wait_s, 60)
-                    logger.warning(f"429 rate-limited, sleeping {wait_s:.1f}s (attempt {attempt+1}/5)")
-                    await asyncio.sleep(wait_s)
-                    continue
-                resp.raise_for_status()
-                data = resp.json()
-                return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            finally:
+                if _client_ctx is not None:
+                    await _client_ctx.__aexit__(None, None, None)
+            if resp.status_code == 429:
+                retry_after = resp.headers.get("retry-after")
+                try:
+                    wait_s = float(retry_after) if retry_after else 5 * (2 ** attempt)
+                except ValueError:
+                    wait_s = 5 * (2 ** attempt)
+                wait_s = min(wait_s, 60)
+                logger.warning(f"429 rate-limited, sleeping {wait_s:.1f}s (attempt {attempt+1}/5)")
+                await asyncio.sleep(wait_s)
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("choices", [{}])[0].get("message", {}).get("content", "")
         except httpx.HTTPStatusError as e:
             logger.error(f"LLM HTTP error: {e.response.status_code} {e.response.text[:200]}")
             return None
@@ -265,7 +279,7 @@ async def process_row(
         raw_response = ""
 
         for attempt in range(3):
-            raw_response = await call_vllm(system, user, temperature)
+            raw_response = await call_vllm(system, user, temperature, http_client=client_http)
             if raw_response:
                 parsed = parse_response(raw_response)
                 if parsed:
@@ -386,10 +400,10 @@ def fetch_batch() -> list[dict]:
                 f"""
                 SELECT v.*
                 FROM {INPUT_VIEW} v
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM {OUTPUT_TABLE} s WHERE s.domain = v.domain
+                WHERE v.domain NOT IN (
+                    SELECT domain FROM {OUTPUT_TABLE}
                 )
-                ORDER BY random()
+                ORDER BY v.domain
                 LIMIT %s
                 """,
                 (BATCH_SIZE,),
@@ -495,7 +509,9 @@ async def main():
                 await work_queue.put(row)
 
     try:
-        async with httpx.AsyncClient() as http_client:
+        # Raise connection pool limits so 200 concurrent coroutines don't queue on socket acquisition
+        _limits = httpx.Limits(max_connections=WORKER_CONCURRENCY + 20, max_keepalive_connections=WORKER_CONCURRENCY)
+        async with httpx.AsyncClient(timeout=60.0, limits=_limits) as http_client:
             producer_task = asyncio.create_task(producer())
             consumer_tasks = [
                 asyncio.create_task(consumer(i, http_client))

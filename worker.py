@@ -47,7 +47,7 @@ BATCH_SIZE = int(os.getenv("BATCH_SIZE", "200"))
 # FLUSH_BATCH_SIZE: how many results to accumulate before writing to DB.
 # Keep this small (default 100) regardless of BATCH_SIZE, so DB writes happen frequently.
 # BATCH_SIZE controls how many rows are fetched from the input view per cycle.
-FLUSH_BATCH_SIZE = int(os.getenv("FLUSH_BATCH_SIZE", "100"))
+FLUSH_BATCH_SIZE = int(os.getenv("FLUSH_BATCH_SIZE", "50"))
 WORKER_CONCURRENCY = int(os.getenv("WORKER_CONCURRENCY", "200"))
 # DB_POOL_SIZE is intentionally decoupled from WORKER_CONCURRENCY.
 # HTTP coroutines = WORKER_CONCURRENCY (200); DB connections = DB_POOL_SIZE (≤40).
@@ -62,6 +62,8 @@ MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "200"))
 TEMPERATURE_INITIAL = float(os.getenv("TEMPERATURE", "0.1"))
 HEALTHCHECK_RETRIES = int(os.getenv("HEALTHCHECK_RETRIES", "3"))
 HEALTHCHECK_DELAY_SEC = int(os.getenv("HEALTHCHECK_DELAY_SEC", "5"))
+WORK_QUEUE_TABLE = os.getenv("WORK_QUEUE_TABLE", "")
+LOW_WATER = int(os.getenv("LOW_WATER", "400"))
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -200,7 +202,7 @@ def build_prompt(row: dict) -> tuple[str, str]:
     user = f"""Business: {company_name} ({city}, {state})
 
 Website content:
-{website_text[:6000]}
+{website_text[:3500]}
 
 Extract every named person mentioned (owners, founders, principals, CEOs, presidents, project managers, estimators, key staff). For each person, capture their title, email, and phone if present in the text.
 
@@ -320,14 +322,14 @@ async def process_row(
         parsed = None
         raw_response = ""
 
-        for attempt in range(3):
+        for attempt in range(2):
             raw_response = await call_vllm(system, user, temperature, http_client=client_http)
             if raw_response:
                 parsed = parse_response(raw_response)
                 if parsed:
                     retry_count = attempt
                     break
-            temperature = [0.1, 0.3, 0.5][attempt]
+            temperature = [0.1, 0.3][attempt]
 
         latency_ms = (time.time() - start) * 1000
 
@@ -417,6 +419,16 @@ def upsert_batch_sync(results: list):
             rows_to_insert,
             page_size=200,
         )
+        # Mark domains done in the claimable work queue (best-effort, same transaction)
+        if WORK_QUEUE_TABLE:
+            try:
+                distinct_domains = list({r.domain for r in results})
+                cur.execute(
+                    f"UPDATE {WORK_QUEUE_TABLE} SET done_at = now() WHERE domain = ANY(%s)",
+                    (distinct_domains,),
+                )
+            except Exception as wq_err:
+                logger.warning(f"Work-queue mark-done failed (reaper will catch): {wq_err}")
         conn.commit()
         logger.info(f"Upserted {len(rows_to_insert)} contact rows from {len(results)} domains")
     except Exception as e:
@@ -435,8 +447,41 @@ def upsert_batch_sync(results: list):
         return_db_connection(conn, broken=broken)
 
 
+def _reap_stale() -> None:
+    """Best-effort: release claimed-but-unfinished rows older than 10 minutes."""
+    if not WORK_QUEUE_TABLE:
+        return
+    conn = None
+    broken = False
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            f"UPDATE {WORK_QUEUE_TABLE} SET claimed_at = NULL "
+            f"WHERE claimed_at < now() - interval '10 minutes' AND done_at IS NULL"
+        )
+        conn.commit()
+        cur.close()
+    except Exception as e:
+        logger.warning(f"Reaper failed (non-fatal): {e}")
+        broken = True
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+    finally:
+        if conn is not None:
+            return_db_connection(conn, broken=broken)
+
+
 def fetch_batch() -> list[dict]:
-    """Fetch next batch from input view. Excludes already-processed domains."""
+    """Fetch next batch of work.
+
+    If WORK_QUEUE_TABLE is set: claim rows via FOR UPDATE SKIP LOCKED from the
+    claimable queue table (multi-replica-safe, no batch-barrier needed).
+    Otherwise: fall back to the old NOT EXISTS query on INPUT_VIEW.
+    """
     last_err = None
     for attempt in range(5):
         conn = None
@@ -444,24 +489,42 @@ def fetch_batch() -> list[dict]:
         broken = False
         try:
             conn = get_db_connection()
-            cur = conn.cursor(cursor_factory=extras.RealDictCursor)
-            # FIX: use NOT EXISTS with indexed lookup instead of NOT IN (SELECT domain ...)
-            # NOT IN builds a giant in-memory list that grows O(n) as staging fills.
-            # NOT EXISTS uses idx_bruin_staging_domain (btree) → O(log n) per row.
-            cur.execute(
-                f"""
-                SELECT v.*
-                FROM {INPUT_VIEW} v
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM {OUTPUT_TABLE} s
-                    WHERE s.domain = v.domain
+            if WORK_QUEUE_TABLE:
+                # Claimable-queue path: claim + return in one transaction
+                cur = conn.cursor(cursor_factory=extras.RealDictCursor)
+                cur.execute(
+                    f"""
+                    UPDATE {WORK_QUEUE_TABLE} SET claimed_at = now()
+                    WHERE raw_id IN (
+                        SELECT raw_id FROM {WORK_QUEUE_TABLE}
+                        WHERE claimed_at IS NULL
+                        ORDER BY raw_id
+                        LIMIT %s
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    RETURNING raw_id, domain, company_name, website_text
+                    """,
+                    (BATCH_SIZE,),
                 )
-                ORDER BY v.domain
-                LIMIT %s
-                """,
-                (BATCH_SIZE,),
-            )
-            rows = cur.fetchall()
+                rows = cur.fetchall()
+                conn.commit()
+            else:
+                # Legacy path: NOT EXISTS dedup against output staging table
+                cur = conn.cursor(cursor_factory=extras.RealDictCursor)
+                cur.execute(
+                    f"""
+                    SELECT v.*
+                    FROM {INPUT_VIEW} v
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM {OUTPUT_TABLE} s
+                        WHERE s.domain = v.domain
+                    )
+                    ORDER BY v.domain
+                    LIMIT %s
+                    """,
+                    (BATCH_SIZE,),
+                )
+                rows = cur.fetchall()
             return [dict(row) for row in rows]
         except Exception as e:
             last_err = e
@@ -544,38 +607,73 @@ async def main():
 
     async def producer():
         """
-        FIX 2026-05-11: producer now waits for the queue to fully drain AND
-        flushes the write buffer before fetching the next batch.  Without this,
-        the NOT IN (SELECT domain FROM staging) subquery re-reads the same
-        BATCH_SIZE domains every cycle because the inserts haven't committed yet,
-        causing an infinite reprocessing loop.
+        Continuous top-up loop (no batch-barrier).
+
+        If WORK_QUEUE_TABLE is set: uses FOR UPDATE SKIP LOCKED — multi-replica-safe;
+        no need to join() before re-fetching because the queue table tracks ownership.
+
+        If WORK_QUEUE_TABLE is empty: falls back to the legacy NOT EXISTS path which
+        still needs the old join+flush before re-fetching (to avoid re-reading the same
+        rows), so we preserve that behaviour in the else branch.
         """
         empty_count = 0
-        while not shutdown_requested:
-            batch = await asyncio.to_thread(fetch_batch)
-            logger.info(f"Producer: fetched batch of {len(batch)} rows")
-            if not batch:
-                empty_count += 1
-                if empty_count >= 5:
-                    logger.info(f"Producer: 5 empty fetches, all domains processed — sending poison pills")
-                    for _ in range(WORKER_CONCURRENCY):
-                        await work_queue.put(None)
-                    return
-                await asyncio.sleep(30)
-                continue
-            empty_count = 0
-            for row in batch:
-                if shutdown_requested:
-                    for _ in range(WORKER_CONCURRENCY):
-                        await work_queue.put(None)
-                    return
-                await work_queue.put(row)
-            # CRITICAL: wait for every queued item to be processed AND committed
-            # before fetching the next batch.  This ensures the NOT IN exclusion
-            # in fetch_batch() sees all newly-inserted staging rows.
-            await work_queue.join()
-            await flush_write_buffer()
-            logger.info("Producer: batch drained and flushed — fetching next batch")
+
+        if WORK_QUEUE_TABLE:
+            # Continuous claimable-queue path
+            while not shutdown_requested:
+                # Run stale-claim reaper every loop (best-effort, cheap)
+                await asyncio.to_thread(_reap_stale)
+
+                if work_queue.qsize() < LOW_WATER:
+                    batch = await asyncio.to_thread(fetch_batch)
+                    logger.info(f"Producer: fetched batch of {len(batch)} rows")
+                    if batch:
+                        empty_count = 0
+                        for row in batch:
+                            if shutdown_requested:
+                                for _ in range(WORKER_CONCURRENCY):
+                                    await work_queue.put(None)
+                                return
+                            await work_queue.put(row)
+                    else:
+                        empty_count += 1
+                        if empty_count >= 5:
+                            logger.info("Producer: 5 empty fetches, work queue exhausted — sending poison pills")
+                            for _ in range(WORKER_CONCURRENCY):
+                                await work_queue.put(None)
+                            # Flush any remaining write buffer before exiting
+                            await flush_write_buffer()
+                            return
+                        await asyncio.sleep(15)
+                else:
+                    # Queue is healthy — don't busy-spin
+                    await asyncio.sleep(2)
+        else:
+            # Legacy batch-barrier path (NOT EXISTS dedup, single-replica safe)
+            while not shutdown_requested:
+                batch = await asyncio.to_thread(fetch_batch)
+                logger.info(f"Producer: fetched batch of {len(batch)} rows")
+                if not batch:
+                    empty_count += 1
+                    if empty_count >= 5:
+                        logger.info("Producer: 5 empty fetches, all domains processed — sending poison pills")
+                        for _ in range(WORKER_CONCURRENCY):
+                            await work_queue.put(None)
+                        return
+                    await asyncio.sleep(30)
+                    continue
+                empty_count = 0
+                for row in batch:
+                    if shutdown_requested:
+                        for _ in range(WORKER_CONCURRENCY):
+                            await work_queue.put(None)
+                        return
+                    await work_queue.put(row)
+                # CRITICAL: wait for queue to drain + flush before next fetch
+                # so NOT EXISTS sees the committed staging rows.
+                await work_queue.join()
+                await flush_write_buffer()
+                logger.info("Producer: batch drained and flushed — fetching next batch")
 
     try:
         # Raise connection pool limits so 200 concurrent coroutines don't queue on socket acquisition

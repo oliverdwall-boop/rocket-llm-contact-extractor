@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
-Rocket Alumni LLM Contact Extractor
-Pulls website summaries from Supabase, calls Vast.ai vLLM (Gemma 2 9B),
-extracts structured contact JSON, upserts to output table.
+Bruin Corp LLM Contact Extractor
+Pulls website summaries from Supabase (v_bruin_llm_input_2026_05_08),
+calls Vast.ai vLLM (Qwen 2.5-7B), extracts structured contact JSON,
+upserts one row per contact to bruin_llm_contacts_staging_2026_05_08.
+
+Forked from Rocket Alumni extractor — adapted for construction-business schema:
+  input:  domain, company_name, city, state, website_text
+  output: domain, contact_name, contact_title, contact_email, contact_phone,
+          contact_linkedin, llm_raw_response, llm_status
 """
 
 import asyncio
@@ -12,9 +18,9 @@ import os
 import signal
 import sys
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import httpx
 import psycopg2
@@ -26,27 +32,26 @@ load_dotenv()
 
 # Configuration
 SUPABASE_URL = os.getenv("SUPABASE_RAW_POOLER_URL", "postgres://...")
-# VAST_VLLM_URL accepts comma-separated list for multi-GPU round-robin load balancing
 _RAW_URLS = os.getenv("VAST_VLLM_URL", "PLACEHOLDER")
 VAST_VLLM_URLS = [u.strip().rstrip("/") for u in _RAW_URLS.split(",") if u.strip()]
-VAST_VLLM_URL = VAST_VLLM_URLS[0] if VAST_VLLM_URLS else "PLACEHOLDER"  # back-compat single-URL refs
 import itertools as _itertools, threading as _threading
 _url_cycle = _itertools.cycle(VAST_VLLM_URLS) if VAST_VLLM_URLS else _itertools.cycle(["PLACEHOLDER"])
 _url_lock = _threading.Lock()
 def _next_vllm_url() -> str:
     with _url_lock:
         return next(_url_cycle)
+
 LLM_API_KEY = os.getenv("LLM_API_KEY") or os.getenv("GROQ_API_KEY") or os.getenv("OPENROUTER_API_KEY")
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "50"))
-WORKER_CONCURRENCY = int(os.getenv("WORKER_CONCURRENCY", "4"))
-MODEL_NAME = os.getenv("MODEL_NAME", "google/gemma-2-9b-it")
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "200"))
+WORKER_CONCURRENCY = int(os.getenv("WORKER_CONCURRENCY", "200"))
+MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-INPUT_VIEW = os.getenv("INPUT_VIEW", "v_rocket_llm_input_2026_05_06")
-OUTPUT_TABLE = os.getenv("OUTPUT_TABLE", "rocket_llm_contacts_2026_05_06")
-MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "1024"))
+INPUT_VIEW = os.getenv("INPUT_VIEW", "public.v_bruin_llm_input_2026_05_08")
+OUTPUT_TABLE = os.getenv("OUTPUT_TABLE", "public.bruin_llm_contacts_staging_2026_05_08")
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "200"))
 TEMPERATURE_INITIAL = float(os.getenv("TEMPERATURE", "0.1"))
-HEALTHCHECK_RETRIES = int(os.getenv("HEALTHCHECK_RETRIES", "20"))
-HEALTHCHECK_DELAY_SEC = int(os.getenv("HEALTHCHECK_DELAY_SEC", "30"))
+HEALTHCHECK_RETRIES = int(os.getenv("HEALTHCHECK_RETRIES", "3"))
+HEALTHCHECK_DELAY_SEC = int(os.getenv("HEALTHCHECK_DELAY_SEC", "5"))
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -65,11 +70,9 @@ def signal_handler(sig, frame):
 
 @dataclass
 class ContactExtractionResult:
-    domain_key: str
-    school_name: str
-    city: str
-    state: str
-    contacts: list
+    """One row per business domain — contacts array exploded on write."""
+    domain: str
+    contacts: list          # [{name, title, email, phone}]
     generic_emails: list
     owner_name: str
     owner_title: str
@@ -83,13 +86,11 @@ class ContactExtractionResult:
 
 
 def get_db_connection():
-    """Create a fresh DB connection (not pooled, per Railway guidelines)."""
     return psycopg2.connect(SUPABASE_URL)
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
 async def healthcheck_vllm():
-    """Verify EVERY configured LLM endpoint is live and model is loaded."""
     headers = {}
     if LLM_API_KEY:
         headers["Authorization"] = f"Bearer {LLM_API_KEY}"
@@ -111,7 +112,6 @@ async def healthcheck_vllm():
 
 
 async def wait_for_vllm_startup():
-    """Poll vLLM until ready, up to 10 minutes."""
     deadline = time.time() + (HEALTHCHECK_RETRIES * HEALTHCHECK_DELAY_SEC)
     attempt = 0
     while time.time() < deadline:
@@ -132,50 +132,56 @@ async def wait_for_vllm_startup():
 
 
 def strip_markdown_fences(text: str) -> str:
-    """Remove ```json ... ``` wrappers if present."""
     text = text.strip()
     if text.startswith("```json"):
-        text = text[7:]  # Remove ```json
+        text = text[7:]
     if text.startswith("```"):
-        text = text[3:]  # Remove ```
+        text = text[3:]
     if text.endswith("```"):
         text = text[:-3]
     return text.strip()
 
 
 def build_prompt(row: dict) -> tuple[str, str]:
-    """Build system and user prompt from row data."""
+    """Build system and user prompt for bruin construction-business contact extraction."""
+    company_name = row.get("company_name") or row.get("name") or ""
+    city = row.get("city") or ""
+    state = row.get("state") or ""
+    website_text = row.get("website_text") or ""
+
     system = (
-        "You extract contact information from school website text. "
+        "You extract contact information from US construction-industry "
+        "business websites (general contractors, commercial real estate, "
+        "home inspectors, builders, renovators). "
         "Output STRICT JSON only — no markdown, no explanations, no code fences."
     )
-    user = f"""Website summary for {row['school_name']} ({row['city']}, {row['state']}):
+    user = f"""Business: {company_name} ({city}, {state})
 
-{row['website_summary_8k']}
+Website content:
+{website_text[:6000]}
 
-Extract every named person mentioned (administrators, board members, principals, athletic directors, alumni directors, coaches, teachers, staff). For each person extract their title and email if present in the text.
+Extract every named person mentioned (owners, founders, principals, CEOs, presidents, project managers, estimators, key staff). For each person, capture their title, email, and phone if present in the text.
 
 Return ONLY this JSON structure:
 {{
   "contacts": [
-    {{"name": "Jane Smith", "title": "Principal", "email": "jane@example.edu"}}
+    {{"name": "Jane Smith", "title": "President", "email": "jane@example.com", "phone": "+1-555-0100"}}
   ],
-  "generic_emails": ["info@example.edu", "admissions@example.edu"],
-  "owner_name": "John Smith",
-  "owner_title": "Head of School"
+  "generic_emails": ["info@example.com", "ops@example.com"],
+  "owner_name": "Jane Smith",
+  "owner_title": "President"
 }}
 
 Rules:
 - Only extract data EXPLICITLY present in the text. Never fabricate.
-- contacts: array of {{name, title, email}}. Empty string for unknown email.
-- generic_emails: department emails (info@, admissions@, contact@, etc).
-- owner_name/owner_title: single top executive (Head of School, Superintendent, Principal) if clearly named. Otherwise empty string.
-- Return valid JSON. No prose."""
+- contacts: array of named people. Empty array if none found.
+- generic_emails: role-based emails (info@, contact@, sales@). Empty array if none.
+- owner_name/owner_title: single top executive if clearly named. Empty string if ambiguous.
+- Return valid JSON. No prose. No code fences."""
     return system, user
 
 
 async def call_vllm(system: str, user: str, temperature: float = TEMPERATURE_INITIAL) -> Optional[str]:
-    """Call vLLM endpoint and return raw response text."""
     payload = {
         "model": MODEL_NAME,
         "messages": [
@@ -185,7 +191,6 @@ async def call_vllm(system: str, user: str, temperature: float = TEMPERATURE_INI
         "max_tokens": MAX_OUTPUT_TOKENS,
         "temperature": temperature,
     }
-    # Try with response_format; many vLLM instances ignore it gracefully
     try:
         payload["response_format"] = {"type": "json_object"}
     except Exception:
@@ -195,11 +200,9 @@ async def call_vllm(system: str, user: str, temperature: float = TEMPERATURE_INI
     if LLM_API_KEY:
         headers["Authorization"] = f"Bearer {LLM_API_KEY}"
 
-    # Round-robin: pick the next endpoint from the configured pool
     base = _next_vllm_url().rstrip("/")
     completions_path = "/chat/completions" if base.endswith("/v1") else "/v1/chat/completions"
 
-    # Retry on 429 with backoff. Up to 5 attempts, exponentially increasing wait.
     for attempt in range(5):
         try:
             async with httpx.AsyncClient(timeout=60.0) as client:
@@ -209,14 +212,10 @@ async def call_vllm(system: str, user: str, temperature: float = TEMPERATURE_INI
                     headers=headers,
                 )
                 if resp.status_code == 429:
-                    # Honor Retry-After header if present, else exponential backoff
                     retry_after = resp.headers.get("retry-after")
-                    if retry_after:
-                        try:
-                            wait_s = float(retry_after)
-                        except ValueError:
-                            wait_s = 5 * (2 ** attempt)
-                    else:
+                    try:
+                        wait_s = float(retry_after) if retry_after else 5 * (2 ** attempt)
+                    except ValueError:
                         wait_s = 5 * (2 ** attempt)
                     wait_s = min(wait_s, 60)
                     logger.warning(f"429 rate-limited, sleeping {wait_s:.1f}s (attempt {attempt+1}/5)")
@@ -236,7 +235,6 @@ async def call_vllm(system: str, user: str, temperature: float = TEMPERATURE_INI
 
 
 def parse_response(raw: str) -> Optional[dict]:
-    """Parse JSON from response, strip markdown if needed."""
     if not raw:
         return None
     cleaned = strip_markdown_fences(raw)
@@ -250,8 +248,15 @@ def parse_response(raw: str) -> Optional[dict]:
 async def process_row(
     row: dict, semaphore: asyncio.Semaphore, client_http: httpx.AsyncClient
 ) -> ContactExtractionResult:
-    """Process a single row: call vLLM, parse, return result."""
     async with semaphore:
+        # Use domain as the key (bruin view exposes domain or root_domain)
+        domain = (
+            row.get("domain")
+            or row.get("root_domain")
+            or row.get("website")
+            or str(row.get("id", ""))
+        )
+
         start = time.time()
         system, user = build_prompt(row)
         retry_count = 0
@@ -259,7 +264,6 @@ async def process_row(
         parsed = None
         raw_response = ""
 
-        # Retry up to 3 times with temperature bump
         for attempt in range(3):
             raw_response = await call_vllm(system, user, temperature)
             if raw_response:
@@ -271,13 +275,12 @@ async def process_row(
 
         latency_ms = (time.time() - start) * 1000
 
-        # Build result
         if parsed:
-            extraction_status = "success"
-            contacts = parsed.get("contacts", [])
-            generic_emails = parsed.get("generic_emails", [])
-            owner_name = parsed.get("owner_name", "")
-            owner_title = parsed.get("owner_title", "")
+            extraction_status = "ok"
+            contacts = parsed.get("contacts", []) or []
+            generic_emails = parsed.get("generic_emails", []) or []
+            owner_name = parsed.get("owner_name", "") or ""
+            owner_title = parsed.get("owner_title", "") or ""
         else:
             extraction_status = "parse_failed"
             contacts = []
@@ -286,10 +289,7 @@ async def process_row(
             owner_title = ""
 
         return ContactExtractionResult(
-            domain_key=row["domain_key"],
-            school_name=row["school_name"],
-            city=row["city"],
-            state=row["state"],
+            domain=domain,
             contacts=contacts,
             generic_emails=generic_emails,
             owner_name=owner_name,
@@ -297,67 +297,83 @@ async def process_row(
             model_used=MODEL_NAME,
             extracted_at=datetime.utcnow().isoformat(),
             latency_ms=latency_ms,
-            raw_response=raw_response,
+            raw_response=raw_response[:4000] if raw_response else "",
             retry_count=retry_count,
             extraction_status=extraction_status,
-            source_summary_chars=len(row.get("website_summary_8k", "")),
+            source_summary_chars=len(row.get("website_text", "") or ""),
         )
 
 
-def upsert_batch_sync(results: list[ContactExtractionResult]):
-    """Sync upsert (called via asyncio.to_thread to keep event loop responsive)."""
+def upsert_batch_sync(results: list):
+    """
+    Explode contacts array into one staging row per contact.
+    Schema: domain, contact_name, contact_title, contact_email, contact_phone,
+            contact_linkedin, llm_raw_response, llm_status, extracted_at
+    """
     if not results:
         return
+    rows_to_insert = []
+    for r in results:
+        # Always write at least one row per domain (even if no contacts found)
+        if r.contacts:
+            for c in r.contacts:
+                if not isinstance(c, dict):
+                    continue
+                rows_to_insert.append((
+                    r.domain,
+                    c.get("name") or None,
+                    c.get("title") or None,
+                    c.get("email") or None,
+                    c.get("phone") or None,
+                    c.get("linkedin") or None,
+                    r.raw_response[:4000] if r.raw_response else None,
+                    r.extraction_status,
+                ))
+        else:
+            # No contacts found — write a single sentinel row so we don't re-process
+            rows_to_insert.append((
+                r.domain,
+                r.owner_name or None,
+                r.owner_title or None,
+                None,
+                None,
+                None,
+                r.raw_response[:4000] if r.raw_response else None,
+                r.extraction_status,
+            ))
+
+    if not rows_to_insert:
+        return
+
     conn = get_db_connection()
     try:
         cur = conn.cursor()
-        values = [
-            (
-                r.domain_key, r.school_name, r.city, r.state,
-                extras.Json(r.contacts), extras.Json(r.generic_emails),
-                r.owner_name, r.owner_title, r.model_used, r.extracted_at,
-                r.latency_ms, r.raw_response, r.retry_count, r.extraction_status,
-                r.source_summary_chars,
-            )
-            for r in results
-        ]
         extras.execute_values(
             cur,
             f"""
             INSERT INTO {OUTPUT_TABLE}
-            (domain_key, school_name, city, state, contacts, generic_emails,
-             owner_name, owner_title, model_used, extracted_at, latency_ms,
-             raw_response, retry_count, extraction_status, source_summary_chars)
+            (domain, contact_name, contact_title, contact_email, contact_phone,
+             contact_linkedin, llm_raw_response, llm_status)
             VALUES %s
-            ON CONFLICT (domain_key) DO UPDATE SET
-              contacts = EXCLUDED.contacts,
-              generic_emails = EXCLUDED.generic_emails,
-              owner_name = EXCLUDED.owner_name,
-              owner_title = EXCLUDED.owner_title,
-              model_used = EXCLUDED.model_used,
-              extracted_at = EXCLUDED.extracted_at,
-              latency_ms = EXCLUDED.latency_ms,
-              raw_response = EXCLUDED.raw_response,
-              retry_count = EXCLUDED.retry_count,
-              extraction_status = EXCLUDED.extraction_status,
-              source_summary_chars = EXCLUDED.source_summary_chars,
-              updated_at = now()
             """,
-            values,
-            page_size=100,
+            rows_to_insert,
+            page_size=200,
         )
         conn.commit()
-        logger.info(f"Upserted {len(results)} rows (execute_values)")
+        logger.info(f"Upserted {len(rows_to_insert)} contact rows from {len(results)} domains")
     except Exception as e:
         logger.error(f"Upsert failed: {e}")
         conn.rollback()
     finally:
-        cur.close()
+        try:
+            cur.close()
+        except Exception:
+            pass
         conn.close()
 
 
 def fetch_batch() -> list[dict]:
-    """Fetch next batch from input view with retry on transient pool errors."""
+    """Fetch next batch from input view. Excludes already-processed domains."""
     last_err = None
     for attempt in range(5):
         conn = None
@@ -365,8 +381,17 @@ def fetch_batch() -> list[dict]:
         try:
             conn = get_db_connection()
             cur = conn.cursor(cursor_factory=extras.RealDictCursor)
+            # Exclude domains already in staging so we don't reprocess
             cur.execute(
-                f"SELECT * FROM {INPUT_VIEW} ORDER BY random() LIMIT %s",
+                f"""
+                SELECT v.*
+                FROM {INPUT_VIEW} v
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM {OUTPUT_TABLE} s WHERE s.domain = v.domain
+                )
+                ORDER BY random()
+                LIMIT %s
+                """,
                 (BATCH_SIZE,),
             )
             rows = cur.fetchall()
@@ -380,21 +405,23 @@ def fetch_batch() -> list[dict]:
             try:
                 if conn: conn.close()
             except Exception: pass
-            time.sleep(2 ** attempt)  # 1, 2, 4, 8, 16s backoff
+            time.sleep(2 ** attempt)
     logger.error(f"Fetch batch gave up after 5 retries: {last_err}")
     return []
 
 
 async def main():
-    """Continuous queue + N consumers + shared httpx.AsyncClient (Layer A)."""
     global shutdown_requested
 
     signal.signal(signal.SIGTERM, signal_handler)
 
-    logger.info(f"Starting Rocket Alumni LLM Contact Extractor")
+    logger.info(f"Starting Bruin Corp LLM Contact Extractor")
+    logger.info(f"  Input view:  {INPUT_VIEW}")
+    logger.info(f"  Output table: {OUTPUT_TABLE}")
     logger.info(f"  vLLM URLs ({len(VAST_VLLM_URLS)}): {VAST_VLLM_URLS}")
     logger.info(f"  Model: {MODEL_NAME}")
     logger.info(f"  Batch size: {BATCH_SIZE}, Concurrency: {WORKER_CONCURRENCY}")
+    logger.info(f"  Max output tokens: {MAX_OUTPUT_TOKENS}")
 
     if not await wait_for_vllm_startup():
         logger.error("Failed to connect to vLLM; exiting")
@@ -419,7 +446,7 @@ async def main():
         rows_done += len(chunk)
         elapsed = time.time() - start_time
         rate = rows_done / elapsed if elapsed > 0 else 0
-        logger.info(f"Progress: {rows_done} rows, rate={rate:.2f}/sec")
+        logger.info(f"Progress: {rows_done} domains processed, rate={rate:.2f}/sec")
 
     async def consumer(cid: int, http_client: httpx.AsyncClient):
         while True:
@@ -448,17 +475,16 @@ async def main():
     async def producer():
         empty_count = 0
         while not shutdown_requested:
-            # Off-load sync DB call to a thread so event loop stays free for consumers
             batch = await asyncio.to_thread(fetch_batch)
             logger.info(f"Producer: fetched batch of {len(batch)} rows")
             if not batch:
                 empty_count += 1
                 if empty_count >= 5:
-                    logger.info(f"Producer: 5 empty fetches, sending poison pills")
+                    logger.info(f"Producer: 5 empty fetches, all domains processed — sending poison pills")
                     for _ in range(WORKER_CONCURRENCY):
                         await work_queue.put(None)
                     return
-                await asyncio.sleep(60)
+                await asyncio.sleep(30)
                 continue
             empty_count = 0
             for row in batch:
@@ -484,7 +510,7 @@ async def main():
 
     elapsed = time.time() - start_time
     rate = rows_done / elapsed if elapsed > 0 else 0
-    logger.info(f"DRAIN DONE: {rows_done} rows in {elapsed:.1f}s ({rate:.2f}/sec)")
+    logger.info(f"DRAIN DONE: {rows_done} domains in {elapsed:.1f}s ({rate:.2f}/sec)")
 
 
 if __name__ == "__main__":

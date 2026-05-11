@@ -24,6 +24,7 @@ from typing import Any, List, Optional
 
 import httpx
 import psycopg2
+import psycopg2.pool
 from psycopg2 import extras
 from dotenv import load_dotenv
 from tenacity import retry, stop_after_attempt, wait_fixed
@@ -31,7 +32,7 @@ from tenacity import retry, stop_after_attempt, wait_fixed
 load_dotenv()
 
 # Configuration
-SUPABASE_URL = os.getenv("SUPABASE_RAW_POOLER_URL", "postgres://...")
+SUPABASE_URL = os.getenv("DATABASE_URL") or os.getenv("SUPABASE_RAW_POOLER_URL", "postgres://...")
 _RAW_URLS = os.getenv("VAST_VLLM_URL", "PLACEHOLDER")
 VAST_VLLM_URLS = [u.strip().rstrip("/") for u in _RAW_URLS.split(",") if u.strip()]
 import itertools as _itertools, threading as _threading
@@ -44,6 +45,11 @@ def _next_vllm_url() -> str:
 LLM_API_KEY = os.getenv("LLM_API_KEY") or os.getenv("GROQ_API_KEY") or os.getenv("OPENROUTER_API_KEY")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "200"))
 WORKER_CONCURRENCY = int(os.getenv("WORKER_CONCURRENCY", "200"))
+# DB_POOL_SIZE is intentionally decoupled from WORKER_CONCURRENCY.
+# HTTP coroutines = WORKER_CONCURRENCY (200); DB connections = DB_POOL_SIZE (≤40).
+# 200 coroutines share the small pool — acquire conn → write → release immediately.
+DB_POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "20"))
+DB_POOL_SIZE = min(DB_POOL_SIZE, 40)  # hard cap — never exceed TX pooler safe ceiling
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 INPUT_VIEW = os.getenv("INPUT_VIEW", "public.v_bruin_llm_input_2026_05_08")
@@ -85,8 +91,40 @@ class ContactExtractionResult:
     source_summary_chars: int
 
 
+# Shared threadsafe connection pool — DB_POOL_SIZE connections max (≤40).
+# Both fetch_batch() and upsert_batch_sync() draw from this pool.
+# Decoupled from WORKER_CONCURRENCY so 200 HTTP coroutines never open 200 DB conns.
+_db_pool: Optional[psycopg2.pool.ThreadedConnectionPool] = None
+_db_pool_lock = _threading.Lock()
+
+def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
+    global _db_pool
+    if _db_pool is not None:
+        return _db_pool
+    with _db_pool_lock:
+        if _db_pool is None:
+            _db_pool = psycopg2.pool.ThreadedConnectionPool(
+                minconn=2,
+                maxconn=DB_POOL_SIZE,
+                dsn=SUPABASE_URL,
+            )
+            logging.getLogger(__name__).info(
+                f"DB pool created: minconn=2 maxconn={DB_POOL_SIZE} (WORKER_CONCURRENCY={WORKER_CONCURRENCY})"
+            )
+    return _db_pool
+
+
 def get_db_connection():
-    return psycopg2.connect(SUPABASE_URL)
+    """Acquire a connection from the shared pool. Caller MUST call return_db_connection() when done."""
+    return _get_pool().getconn()
+
+
+def return_db_connection(conn, broken: bool = False):
+    """Return a connection to the pool (or discard if broken)."""
+    try:
+        _get_pool().putconn(conn, close=broken)
+    except Exception:
+        pass
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
@@ -360,6 +398,8 @@ def upsert_batch_sync(results: list):
         return
 
     conn = get_db_connection()
+    broken = False
+    cur = None
     try:
         cur = conn.cursor()
         extras.execute_values(
@@ -377,13 +417,18 @@ def upsert_batch_sync(results: list):
         logger.info(f"Upserted {len(rows_to_insert)} contact rows from {len(results)} domains")
     except Exception as e:
         logger.error(f"Upsert failed: {e}")
-        conn.rollback()
-    finally:
+        broken = True
         try:
-            cur.close()
+            conn.rollback()
         except Exception:
             pass
-        conn.close()
+    finally:
+        try:
+            if cur:
+                cur.close()
+        except Exception:
+            pass
+        return_db_connection(conn, broken=broken)
 
 
 def fetch_batch() -> list[dict]:
@@ -392,16 +437,20 @@ def fetch_batch() -> list[dict]:
     for attempt in range(5):
         conn = None
         cur = None
+        broken = False
         try:
             conn = get_db_connection()
             cur = conn.cursor(cursor_factory=extras.RealDictCursor)
-            # Exclude domains already in staging so we don't reprocess
+            # FIX: use NOT EXISTS with indexed lookup instead of NOT IN (SELECT domain ...)
+            # NOT IN builds a giant in-memory list that grows O(n) as staging fills.
+            # NOT EXISTS uses idx_bruin_staging_domain (btree) → O(log n) per row.
             cur.execute(
                 f"""
                 SELECT v.*
                 FROM {INPUT_VIEW} v
-                WHERE v.domain NOT IN (
-                    SELECT domain FROM {OUTPUT_TABLE}
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM {OUTPUT_TABLE} s
+                    WHERE s.domain = v.domain
                 )
                 ORDER BY v.domain
                 LIMIT %s
@@ -412,14 +461,17 @@ def fetch_batch() -> list[dict]:
             return [dict(row) for row in rows]
         except Exception as e:
             last_err = e
+            broken = True
             logger.warning(f"Fetch batch attempt {attempt+1}/5 failed: {e}")
-            try:
-                if cur: cur.close()
-            except Exception: pass
-            try:
-                if conn: conn.close()
-            except Exception: pass
             time.sleep(2 ** attempt)
+        finally:
+            try:
+                if cur:
+                    cur.close()
+            except Exception:
+                pass
+            if conn is not None:
+                return_db_connection(conn, broken=broken)
     logger.error(f"Fetch batch gave up after 5 retries: {last_err}")
     return []
 
